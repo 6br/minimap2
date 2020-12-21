@@ -79,11 +79,11 @@ static char *mm_escape(char *s)
 	return s;
 }
 
-static void sam_write_rg_line(kstring_t *str, const char *s)
+static int sam_write_rg_line(kstring_t *str, const char *s)
 {
 	char *p, *q, *r, *rg_line = 0;
 	memset(mm_rg_id, 0, 256);
-	if (s == 0) return;
+	if (s == 0) return 0;
 	if (strstr(s, "@RG") != s) {
 		if (mm_verbose >= 1) fprintf(stderr, "[ERROR] the read group line is not started with @RG\n");
 		goto err_set_rg;
@@ -108,20 +108,23 @@ static void sam_write_rg_line(kstring_t *str, const char *s)
 	for (q = p, r = mm_rg_id; *q && *q != '\t' && *q != '\n'; ++q)
 		*r++ = *q;
 	mm_sprintf_lite(str, "%s\n", rg_line);
+	return 0;
 
 err_set_rg:
 	free(rg_line);
+	return -1;
 }
 
-void mm_write_sam_hdr(const mm_idx_t *idx, const char *rg, const char *ver, int argc, char *argv[])
+int mm_write_sam_hdr(const mm_idx_t *idx, const char *rg, const char *ver, int argc, char *argv[])
 {
 	kstring_t str = {0,0,0};
+	int ret = 0;
 	if (idx) {
 		uint32_t i;
 		for (i = 0; i < idx->n_seq; ++i)
 			mm_sprintf_lite(&str, "@SQ\tSN:%s\tLN:%d\n", idx->seq[i].name, idx->seq[i].len);
 	}
-	if (rg) sam_write_rg_line(&str, rg);
+	if (rg) ret = sam_write_rg_line(&str, rg);
 	mm_sprintf_lite(&str, "@PG\tID:minimap2\tPN:minimap2");
 	if (ver) mm_sprintf_lite(&str, "\tVN:%s", ver);
 	if (argc > 1) {
@@ -132,6 +135,7 @@ void mm_write_sam_hdr(const mm_idx_t *idx, const char *rg, const char *ver, int 
 	}
 	mm_err_puts(str.s);
 	free(str.s);
+	return ret;
 }
 
 static void write_cs_core(kstring_t *s, const uint8_t *tseq, const uint8_t *qseq, const mm_reg1_t *r, char *tmp, int no_iden, int write_tag)
@@ -270,7 +274,7 @@ double mm_event_identity(const mm_reg1_t *r)
 		if (op == 1 || op == 2)
 			++n_gapo, n_gap += len;
 	}
-	return (double)r->mlen / (r->blen - r->p->n_ambi - n_gap + n_gapo);
+	return (double)r->mlen / (r->blen - n_gap + n_gapo);
 }
 
 static inline void write_tags(kstring_t *s, const mm_reg1_t *r)
@@ -301,11 +305,12 @@ static inline void write_tags(kstring_t *s, const mm_reg1_t *r)
 	if (r->split) mm_sprintf_lite(s, "\tzd:i:%d", r->split);
 }
 
-void mm_write_paf(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, const mm_reg1_t *r, void *km, int opt_flag)
+void mm_write_paf3(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, const mm_reg1_t *r, void *km, int opt_flag, int rep_len)
 {
 	s->l = 0;
 	if (r == 0) {
-		mm_sprintf_lite(s, "%s\t%d", t->name, t->l_seq);
+		mm_sprintf_lite(s, "%s\t%d\t0\t0\t*\t*\t0\t0\t0\t0\t0\t0", t->name, t->l_seq);
+		if (rep_len >= 0) mm_sprintf_lite(s, "\trl:i:%d", rep_len);
 		return;
 	}
 	mm_sprintf_lite(s, "%s\t%d\t%d\t%d\t%c\t", t->name, t->l_seq, r->qs, r->qe, "+-"[r->rev]);
@@ -315,6 +320,7 @@ void mm_write_paf(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, const m
 	mm_sprintf_lite(s, "\t%d\t%d", r->mlen, r->blen);
 	mm_sprintf_lite(s, "\t%d", r->mapq);
 	write_tags(s, r);
+	if (rep_len >= 0) mm_sprintf_lite(s, "\trl:i:%d", rep_len);
 	if (r->p && (opt_flag & MM_F_OUT_CG)) {
 		uint32_t k;
 		mm_sprintf_lite(s, "\tcg:Z:");
@@ -325,6 +331,11 @@ void mm_write_paf(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, const m
 		write_cs_or_MD(km, s, mi, t, r, !(opt_flag&MM_F_OUT_CS_LONG), opt_flag&MM_F_OUT_MD, 1);
 	if ((opt_flag & MM_F_COPY_COMMENT) && t->comment)
 		mm_sprintf_lite(s, "\t%s", t->comment);
+}
+
+void mm_write_paf(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, const mm_reg1_t *r, void *km, int opt_flag)
+{
+	mm_write_paf3(s, mi, t, r, km, opt_flag, -1);
 }
 
 static void sam_write_sq(kstring_t *s, char *seq, int l, int rev, int comp)
@@ -368,6 +379,7 @@ static void write_sam_cigar(kstring_t *s, int sam_flag, int in_tag, int qlen, co
 			if (clip_len[1]) mm_sprintf_lite(s, ",%u", clip_len[1]<<4|clip_char);
 		} else {
 			int clip_char = (sam_flag&0x800) && !(opt_flag&MM_F_SOFTCLIP)? 'H' : 'S';
+			assert(clip_len[0] < qlen && clip_len[1] < qlen);
 			if (clip_len[0]) mm_sprintf_lite(s, "%d%c", clip_len[0], clip_char);
 			for (k = 0; k < r->p->n_cigar; ++k)
 				mm_sprintf_lite(s, "%d%c", r->p->cigar[k]>>4, "MIDNSHP=XB"[r->p->cigar[k]&0xf]);
@@ -376,7 +388,7 @@ static void write_sam_cigar(kstring_t *s, int sam_flag, int in_tag, int qlen, co
 	}
 }
 
-void mm_write_sam2(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, int seg_idx, int reg_idx, int n_seg, const int *n_regss, const mm_reg1_t *const* regss, void *km, int opt_flag)
+void mm_write_sam3(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, int seg_idx, int reg_idx, int n_seg, const int *n_regss, const mm_reg1_t *const* regss, void *km, int opt_flag, int rep_len)
 {
 	const int max_bam_cigar_op = 65535;
 	int flag, n_regs = n_regss[seg_idx], cigar_in_tag = 0;
@@ -452,17 +464,17 @@ void mm_write_sam2(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, int se
 		int tlen = 0;
 		if (this_rid >= 0 && r_next) {
 			if (this_rid == r_next->rid) {
-				int this_pos5 = r && r->rev? r->re - 1 : this_pos;
-				int next_pos5 = r_next->rev? r_next->re - 1 : r_next->rs;
-				tlen = next_pos5 - this_pos5;
+				if (r) {
+					int this_pos5 = r->rev? r->re - 1 : this_pos;
+					int next_pos5 = r_next->rev? r_next->re - 1 : r_next->rs;
+					tlen = next_pos5 - this_pos5;
+				}
 				mm_sprintf_lite(s, "\t=\t");
 			} else mm_sprintf_lite(s, "\t%s\t", mi->seq[r_next->rid].name);
 			mm_sprintf_lite(s, "%d\t", r_next->rs + 1);
 		} else if (r_next) { // && this_rid < 0
 			mm_sprintf_lite(s, "\t%s\t%d\t", mi->seq[r_next->rid].name, r_next->rs + 1);
 		} else if (this_rid >= 0) { // && r_next == NULL
-			int this_pos5 = this_rev? r->re - 1 : this_pos; // this_rev is only true when r != NULL
-			tlen = this_pos - this_pos5; // next_pos5 will be this_pos
 			mm_sprintf_lite(s, "\t=\t%d\t", this_pos + 1); // next segment will take r's coordinate
 		} else mm_sprintf_lite(s, "\t*\t0\t"); // neither has coordinates
 		if (tlen > 0) ++tlen;
@@ -527,11 +539,17 @@ void mm_write_sam2(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, int se
 		if (cigar_in_tag)
 			write_sam_cigar(s, flag, 1, t->l_seq, r, opt_flag);
 	}
+	if (rep_len >= 0) mm_sprintf_lite(s, "\trl:i:%d", rep_len);
 
 	if ((opt_flag & MM_F_COPY_COMMENT) && t->comment)
 		mm_sprintf_lite(s, "\t%s", t->comment);
 
 	s->s[s->l] = 0; // we always have room for an extra byte (see str_enlarge)
+}
+
+void mm_write_sam2(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, int seg_idx, int reg_idx, int n_seg, const int *n_regss, const mm_reg1_t *const* regss, void *km, int opt_flag)
+{
+	mm_write_sam3(s, mi, t, seg_idx, reg_idx, n_seg, n_regss, regss, km, opt_flag, -1);
 }
 
 void mm_write_sam(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, const mm_reg1_t *r, int n_regs, const mm_reg1_t *regs)

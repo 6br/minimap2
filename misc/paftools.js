@@ -1,6 +1,6 @@
 #!/usr/bin/env k8
 
-var paftools_version = '2.15-r905';
+var paftools_version = '2.17-r949-dirty';
 
 /*****************************
  ***** Library functions *****
@@ -433,6 +433,7 @@ function paf_call(args)
 	while (file.readline(buf) >= 0) {
 		var line = buf.toString();
 		var m, t = line.split("\t", 12);
+		if (t.length < 12 || t[5] == '*') continue; // unmapped
 		for (var i = 6; i <= 11; ++i)
 			t[i] = parseInt(t[i]);
 		if (t[10] < min_cov_len || t[11] < min_mapq) continue;
@@ -680,13 +681,12 @@ function paf_asmstat(args)
 			var t = line.split("\t");
 			t[1] = parseInt(t[1]);
 			if (t[1] < min_query_len) continue;
-			if (t.length >= 2) {
-				query[t[0]] = t[1];
-				if (qinfo[t[0]] == null) qinfo[t[0]] = {};
-				qinfo[t[0]].len = t[1];
-				qinfo[t[0]].bp = [];
-			}
-			if (t.length < 9) continue;
+			if (t.length < 2) continue;
+			query[t[0]] = t[1];
+			if (qinfo[t[0]] == null) qinfo[t[0]] = {};
+			qinfo[t[0]].len = t[1];
+			qinfo[t[0]].bp = [];
+			if (t.length < 9 || t[5] == "*") continue;
 			if (!/\ttp:A:[PI]/.test(line)) continue;
 			if ((m = /\tcg:Z:(\S+)/.exec(line)) == null) continue;
 			var cigar = m[1];
@@ -967,7 +967,9 @@ function paf_stat(args)
 			var t = line.split("\t", 12);
 			var m, rs, cigar = null, is_pri = false, is_sam = false, is_rev = false, tname = null;
 			var atlen = null, aqlen, qs, qe, mapq, ori_qlen;
-			if (t[4] == '+' || t[4] == '-') { // PAF
+			if (t.length < 2) continue;
+			if (t[4] == '+' || t[4] == '-' || t[4] == '*') { // PAF
+				if (t[4] == '*') continue; // unmapped
 				if (!/\ts2:i:\d+/.test(line)) {
 					++n_2nd;
 					continue;
@@ -1467,15 +1469,21 @@ function paf_view(args)
 
 function paf_gff2bed(args)
 {
-	var c, fn_ucsc_fai = null, is_short = false, keep_gff = false;
-	while ((c = getopt(args, "u:sg")) != null) {
+	var c, fn_ucsc_fai = null, is_short = false, keep_gff = false, print_junc = false;
+	while ((c = getopt(args, "u:sgj")) != null) {
 		if (c == 'u') fn_ucsc_fai = getopt.arg;
 		else if (c == 's') is_short = true;
 		else if (c == 'g') keep_gff = true;
+		else if (c == 'j') print_junc = true;
 	}
 
 	if (getopt.ind == args.length) {
-		print("Usage: paftools.js gff2bed [-g] [-u ucsc-genome.fa.fai] <in.gff>");
+		print("Usage: paftools.js gff2bed [options] <in.gff>");
+		print("Options:");
+		print("  -j       Output junction BED");
+		print("  -s       Print names in the short form");
+		print("  -u FILE  hg38.fa.fai for chr name conversion");
+		print("  -g       Output GFF (used with -u)");
 		exit(1);
 	}
 
@@ -1501,17 +1509,23 @@ function paf_gff2bed(args)
 
 	var colors = {
 		'protein_coding':'0,128,255',
+		'mRNA':'0,128,255',
 		'lincRNA':'0,192,0',
 		'snRNA':'0,192,0',
 		'miRNA':'0,192,0',
 		'misc_RNA':'0,192,0'
 	};
 
-	function print_bed12(exons, cds_st, cds_en, is_short)
+	function print_bed12(exons, cds_st, cds_en, is_short, print_junc)
 	{
 		if (exons.length == 0) return;
 		var name = is_short? exons[0][7] + "|" + exons[0][5] : exons[0].slice(4, 7).join("|");
 		var a = exons.sort(function(a,b) {return a[1]-b[1]});
+		if (print_junc) {
+		for (var i = 1; i < a.length; ++i)
+			print(a[i][0], a[i-1][2], a[i][1], name, 1000, a[i][3]);
+			return;
+		}
 		var sizes = [], starts = [], st, en;
 		st = a[0][1];
 		en = a[a.length - 1][2];
@@ -1528,8 +1542,8 @@ function paf_gff2bed(args)
 		print(a[0][0], st, en, name, 1000, a[0][3], cds_st, cds_en, color, a.length, sizes.join(",") + ",", starts.join(",") + ",");
 	}
 
-	var re_gtf = /(transcript_id|transcript_type|transcript_biotype|gene_name|transcript_name) "([^"]+)";/g;
-	var re_gff3 = /(transcript_id|transcript_type|transcript_biotype|gene_name|transcript_name)=([^;]+)/g;
+	var re_gtf = /\b(transcript_id|transcript_type|transcript_biotype|gene_name|gene_id|gbkey|transcript_name) "([^"]+)";/g;
+	var re_gff3 = /\b(transcript_id|transcript_type|transcript_biotype|gene_name|gene_id|gbkey|transcript_name)=([^;]+)/g;
 	var buf = new Bytes();
 	var file = args[getopt.ind] == '-'? new File() : new File(args[getopt.ind]);
 
@@ -1546,25 +1560,25 @@ function paf_gff2bed(args)
 		if (t[2] != "CDS" && t[2] != "exon") continue;
 		t[3] = parseInt(t[3]) - 1;
 		t[4] = parseInt(t[4]);
-		var id = null, type = "", gname = "N/A", biotype = "", m, tname = "N/A";
+		var id = null, type = "", name = "N/A", biotype = "", m, tname = "N/A";
 		while ((m = re_gtf.exec(t[8])) != null) {
 			if (m[1] == "transcript_id") id = m[2];
 			else if (m[1] == "transcript_type") type = m[2];
-			else if (m[1] == "transcript_biotype") biotype = m[2];
-			else if (m[1] == "gene_name") name = m[2];
+			else if (m[1] == "transcript_biotype" || m[1] == "gbkey") biotype = m[2];
+			else if (m[1] == "gene_name" || m[1] == "gene_id") name = m[2];
 			else if (m[1] == "transcript_name") tname = m[2];
 		}
 		while ((m = re_gff3.exec(t[8])) != null) {
 			if (m[1] == "transcript_id") id = m[2];
 			else if (m[1] == "transcript_type") type = m[2];
-			else if (m[1] == "transcript_biotype") biotype = m[2];
-			else if (m[1] == "gene_name") name = m[2];
+			else if (m[1] == "transcript_biotype" || m[1] == "gbkey") biotype = m[2];
+			else if (m[1] == "gene_name" || m[1] == "gene_id") name = m[2];
 			else if (m[1] == "transcript_name") tname = m[2];
 		}
 		if (type == "" && biotype != "") type = biotype;
 		if (id == null) throw Error("No transcript_id");
 		if (id != last_id) {
-			print_bed12(exons, cds_st, cds_en, is_short);
+			print_bed12(exons, cds_st, cds_en, is_short, print_junc);
 			exons = [], cds_st = 1<<30, cds_en = 0;
 			last_id = id;
 		}
@@ -1582,7 +1596,7 @@ function paf_gff2bed(args)
 		}
 	}
 	if (last_id != null)
-		print_bed12(exons, cds_st, cds_en, is_short);
+		print_bed12(exons, cds_st, cds_en, is_short, print_junc);
 
 	file.close();
 	buf.destroy();
@@ -1590,11 +1604,16 @@ function paf_gff2bed(args)
 
 function paf_sam2paf(args)
 {
-	var c, pri_only = false, use_eq = false;
-	while ((c = getopt(args, "p")) != null)
+	var c, pri_only = false, long_cs = false;
+	while ((c = getopt(args, "pL")) != null) {
 		if (c == 'p') pri_only = true;
+		else if (c == 'L') long_cs = true;
+	}
 	if (args.length == getopt.ind) {
-		print("Usage: paftools.js sam2paf [-p] <in.sam>");
+		print("Usage: paftools.js sam2paf [options] <in.sam>");
+		print("Options:");
+		print("  -p      convert primary or supplementary alignments only");
+		print("  -L      output the cs tag in the long form");
 		exit(1);
 	}
 
@@ -1623,13 +1642,14 @@ function paf_sam2paf(args)
 		var tlen = ctg_len[t[2]];
 		if (tlen == null) throw Error("at line " + lineno + ": can't find the length of contig " + t[2]);
 		// find tags
-		var nn = 0, NM = null, MD = null, md_list = [];
+		var nn = 0, NM = null, MD = null, cs_str = null, md_list = [];
 		while ((m = re_tag.exec(line)) != null) {
 			if (m[1] == "NM:i") NM = parseInt(m[2]);
 			else if (m[1] == "nn:i") nn = parseInt(m[2]);
 			else if (m[1] == "MD:Z") MD = m[2];
+			else if (m[1] == "cs:Z") cs_str = m[2];
 		}
-		if (t[9] == '*') MD = null;
+		if (t[9] == '*') MD = cs_str = null;
 		// infer various lengths from CIGAR
 		var clip = [0, 0], soft_clip = 0, I = [0, 0], D = [0, 0], M = 0, N = 0, mm = 0, have_M = false, have_ext = false, cigar = [];
 		while ((m = re.exec(t[5])) != null) {
@@ -1665,8 +1685,8 @@ function paf_sam2paf(args)
 		}
 		// parse MD
 		var cs = [];
-		if (MD != null) {
-			var k = 0, cx = 0, cy = 0, mx = 0, my = 0;
+		if (MD != null && cs_str == null && t[9] != "*") {
+			var k = 0, cx = 0, cy = 0, mx = 0, my = 0; // cx: cigar ref position; cy: cigar query; mx: MD ref; my: MD query
 			while ((m = re_MD.exec(MD)) != null) {
 				if (m[2] != null) { // deletion from the reference
 					var len = m[2].length - 1;
@@ -1680,13 +1700,15 @@ function paf_sam2paf(args)
 							if (my + ml < cy + cl) {
 								if (ml > 0) {
 									if (m[3] != null) cs.push('*', m[3], t[9][my]);
+									else if (long_cs) cs.push('=', t[9].substr(my, ml));
 									else cs.push(':', ml);
 								}
 								mx += ml, my += ml, ml = 0;
 								break;
 							} else {
 								var dl = cy + cl - my;
-								cs.push(':', dl);
+								if (long_cs) cs.push('=', t[9].substr(my, dl));
+								else cs.push(':', dl);
 								cx += cl, cy += cl, ++k;
 								mx += dl, my += dl, ml -= dl;
 							}
@@ -1731,7 +1753,8 @@ function paf_sam2paf(args)
 		var tags = ["tp:A:" + type];
 		if (NM != null) tags.push("mm:i:"+mm);
 		tags.push("gn:i:"+(I[1]+D[1]), "go:i:"+(I[0]+D[0]), "cg:Z:" + t[5].replace(/\d+[SH]/g, ''));
-		if (cs.length > 0) tags.push("cs:Z:" + cs.join(""));
+		if (cs_str != null) tags.push("cs:Z:" + cs_str);
+		else if (cs.length > 0) tags.push("cs:Z:" + cs.join(""));
 		// print out
 		var a = [qname, qlen, qs, qe, flag&16? '-' : '+', t[2], tlen, ts, te, mlen, blen, t[4]];
 		print(a.join("\t"), tags.join("\t"));
